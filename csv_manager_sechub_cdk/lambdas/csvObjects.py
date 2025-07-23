@@ -1256,6 +1256,11 @@ class HubActor (Actor):
 
         self.findings = []
         self.count = 0
+        self.next_token = None
+        self.has_more_data = False
+        self.current_batch = 0
+        self.processed_count = 0
+        self.batch_size = 100  # Default batch size for get_findings API
     #---------------------------------------------------------------------------
     def updateFindings (self, region=None, parameters=None):
         """
@@ -1275,70 +1280,195 @@ class HubActor (Actor):
 
         return response
     #---------------------------------------------------------------------------
-    def downloadFindings (self, regions=None, filters={}, limit=0):
+    def downloadFindings(self, regions=None, filters={}, limit=0, next_token=None, batch_size=None):
         """
         Get findings from Security Hub using the securityhub:get_findings API,
         applying filters as necessary, and limiting results as necessary.
+        Enhanced with comprehensive error handling and recovery mechanisms.
+        
+        Args:
+            regions: List of regions to query (defaults to self.regions)
+            filters: Security Hub filters to apply
+            limit: Maximum number of findings to retrieve (0 = no limit)
+            next_token: Pagination token to resume from previous call
+            batch_size: Number of findings to retrieve per API call (defaults to self.batch_size)
+        
+        Returns:
+            List of findings retrieved in this batch
+            
+        Raises:
+            RuntimeError: For unrecoverable errors
+            ValueError: For invalid parameters
         """
-        regions = self.regions
-
+        # Validate input parameters
+        if batch_size is not None and batch_size <= 0:
+            raise ValueError("Batch size must be greater than 0")
+        
+        if limit < 0:
+            raise ValueError("Limit must be non-negative")
+            
+        regions = regions or self.regions
+        batch_size = batch_size or self.batch_size
+        
+        if not regions:
+            raise ValueError("No regions specified for findings retrieval")
+        
+        # Initialize or reset findings list for new batch
         self.findings = []
         downloaded = 0
+        self.has_more_data = False
+        self.next_token = None
+        
+        # Track batch processing
+        self.current_batch += 1
+        
+        _LOGGER.info(f'496370i starting batch {self.current_batch} with token: {next_token[:20] if next_token else "None"}...')
 
-        # Get findings for each region
+        # Track errors across regions
+        region_errors = {}
+        successful_regions = []
+
+        # Get findings for each region with comprehensive error handling
         for region in regions:
-            _LOGGER.info(f'496370i retrieving findings from region {region}')
-
-            # Get SecurityHub client for this region
-            client = self.client[region]
+            _LOGGER.info(f'496371i retrieving findings from region {region}')
 
             try:
-                token = None
-    
-                while True:
-                    if not token:
-                        answer = client.get_findings(
-                            Filters=filters, 
-                            MaxResults=100
-                        ) 
-                    else:
-                        answer = client.get_findings(
-                            Filters=filters, 
-                            MaxResults=100, 
-                            NextToken=token
-                        )
-    
-                    token = answer.get("NextToken", None)
-                    findings = answer.get("Findings", [])
-                    downloaded += len(findings)
+                # Validate client exists for this region
+                if region not in self.client:
+                    error_msg = f"No Security Hub client available for region {region}"
+                    _LOGGER.error(f'496402e {error_msg}')
+                    region_errors[region] = error_msg
+                    continue
 
-                    if (downloaded % 1000) == 0:
-                        _LOGGER.info("496380i ... %8d findings retrieved" \
-                            % downloaded)
+                # Get SecurityHub client for this region
+                client = self.client[region]
+                token = next_token
+                region_downloaded = 0
+                region_api_calls = 0
+                max_api_calls = 100  # Prevent infinite loops
     
-                    self.findings += findings
-    
-                    # This is the last set of findings if there is no "nexttoken"
-                    if not token: 
-                        break
+                while region_api_calls < max_api_calls:
+                    region_api_calls += 1
+                    
+                    try:
+                        # Prepare API call parameters with validation
+                        api_params = {
+                            'Filters': filters or {},
+                            'MaxResults': min(batch_size, 100)  # API limit is 100
+                        }
+                        
+                        if token:
+                            api_params['NextToken'] = token
+                        
+                        _LOGGER.debug(f'496372d calling get_findings (attempt {region_api_calls}) with MaxResults={api_params["MaxResults"]}, token present: {bool(token)}')
+                        
+                        # Make API call with timeout handling
+                        answer = client.get_findings(**api_params)
+        
+                        token = answer.get("NextToken", None)
+                        findings = answer.get("Findings", [])
+                        batch_findings_count = len(findings)
+                        downloaded += batch_findings_count
+                        region_downloaded += batch_findings_count
 
-                    # If we've exceeded the finding limit, we're done
-                    if (limit != 0) and (downloaded > limit):
-                        _LOGGER.info("496390i %d findings exceeds limit of %d" \
-                            % (downloaded, limit))
-                        break
+                        _LOGGER.info(f'496373i retrieved {batch_findings_count} findings from {region} (total this batch: {downloaded})')
+        
+                        self.findings += findings
+                        
+                        # Update processed count for progress tracking
+                        self.processed_count += batch_findings_count
+        
+                        # Check if we have more data available
+                        if token:
+                            self.has_more_data = True
+                            self.next_token = token
+                            _LOGGER.debug(f'496374d more data available, next token: {token[:20]}...')
+                        else:
+                            _LOGGER.debug('496375d no more data available for this region')
+        
+                        # Break if we've reached the batch size limit
+                        if downloaded >= batch_size:
+                            _LOGGER.info(f'496376i batch size limit ({batch_size}) reached')
+                            break
+                            
+                        # Break if we've reached the overall limit
+                        if (limit != 0) and (self.processed_count >= limit):
+                            _LOGGER.info(f'496377i overall limit ({limit}) reached, processed: {self.processed_count}')
+                            self.has_more_data = False
+                            self.next_token = None
+                            break
+        
+                        # This is the last set of findings if there is no "nexttoken"
+                        if not token: 
+                            break
+                            
+                    except client.exceptions.ThrottlingException as throttle_error:
+                        _LOGGER.warning(f'496403w throttling in region {region}, attempt {region_api_calls}: {throttle_error}')
+                        if region_api_calls < max_api_calls:
+                            # Exponential backoff for throttling
+                            import time
+                            wait_time = min(2 ** region_api_calls, 60)  # Cap at 60 seconds
+                            _LOGGER.info(f'496404i waiting {wait_time} seconds before retry')
+                            time.sleep(wait_time)
+                            continue
+                        else:
+                            raise
+                            
+                    except client.exceptions.InvalidNextTokenException as token_error:
+                        _LOGGER.error(f'496405e invalid next token in region {region}: {token_error}')
+                        # Reset token and continue without it
+                        token = None
+                        continue
+                        
+                    except Exception as api_error:
+                        _LOGGER.error(f'496406e API call failed in region {region}, attempt {region_api_calls}: {api_error}')
+                        if region_api_calls < 3:  # Retry up to 3 times
+                            import time
+                            time.sleep(2 ** region_api_calls)  # Exponential backoff
+                            continue
+                        else:
+                            raise
     
                 self.count = len(self.findings)
+                successful_regions.append(region)
+                
+                _LOGGER.info(f'496378i region {region} completed: {region_downloaded} findings retrieved')
 
-                if (limit != 0) and (downloaded > limit):
+                # If we've reached batch size or limit, stop processing other regions
+                if downloaded >= batch_size or ((limit != 0) and (self.processed_count >= limit)):
                     break
     
-            except client.exceptions.InvalidAccessException as thrown:
-                _LOGGER.error('496400e cannot retrieve findings for ' 
-                    + f'region {region}: {thrown.response["Error"]["Message"]}')
+            except client.exceptions.InvalidAccessException as access_error:
+                error_msg = f'Cannot retrieve findings for region {region}: {access_error.response["Error"]["Message"]}'
+                _LOGGER.error(f'496400e {error_msg}')
+                region_errors[region] = error_msg
+                
+            except client.exceptions.ResourceNotFoundException as not_found_error:
+                error_msg = f'Security Hub not found in region {region}: {not_found_error}'
+                _LOGGER.error(f'496407e {error_msg}')
+                region_errors[region] = error_msg
+                
+            except Exception as region_error:
+                error_msg = f'Unexpected error retrieving findings for region {region}: {region_error}'
+                _LOGGER.error(f'496401e {error_msg}')
+                region_errors[region] = error_msg
+                
+                # For critical errors, don't continue with other regions
+                if "credentials" in str(region_error).lower() or "authorization" in str(region_error).lower():
+                    _LOGGER.error(f'496408e Critical authorization error, stopping region processing')
+                    raise RuntimeError(f"Authorization failed for region {region}: {region_error}") from region_error
 
-        _LOGGER.info("496410i retrieved %d total findings from all regions" \
-            % downloaded)
+        # Evaluate overall success
+        if not successful_regions and region_errors:
+            error_summary = "; ".join([f"{region}: {error}" for region, error in region_errors.items()])
+            raise RuntimeError(f"Failed to retrieve findings from all regions: {error_summary}")
+        
+        if region_errors:
+            _LOGGER.warning(f'496409w Some regions failed: {region_errors}')
+        
+        _LOGGER.info(f'496410i batch {self.current_batch} completed: {downloaded} findings retrieved, '
+                    f'total processed: {self.processed_count}, has_more: {self.has_more_data}, '
+                    f'successful_regions: {successful_regions}')
 
         return self.findings
     #---------------------------------------------------------------------------
@@ -1349,6 +1479,67 @@ class HubActor (Actor):
         """
         for finding in self.findings:
             yield finding
+    
+    #---------------------------------------------------------------------------
+    def get_pagination_info(self):
+        """
+        Get current pagination information for Step Function continuation.
+        
+        Returns:
+            dict: Pagination information including nextToken, hasMore, processedCount, currentBatch
+        """
+        return {
+            "nextToken": self.next_token,
+            "hasMore": self.has_more_data,
+            "processedCount": self.processed_count,
+            "currentBatch": self.current_batch,
+            "lastBatchSize": self.count
+        }
+    
+    #---------------------------------------------------------------------------
+    def reset_pagination_state(self):
+        """
+        Reset pagination state for a new export operation.
+        """
+        self.next_token = None
+        self.has_more_data = False
+        self.current_batch = 0
+        self.processed_count = 0
+        self.findings = []
+        self.count = 0
+        
+        _LOGGER.info("496420i HubActor pagination state reset")
+    
+    #---------------------------------------------------------------------------
+    def set_batch_size(self, batch_size):
+        """
+        Set the batch size for findings retrieval.
+        
+        Args:
+            batch_size (int): Number of findings to retrieve per batch
+        """
+        if batch_size <= 0:
+            raise ValueError("Batch size must be greater than 0")
+        
+        self.batch_size = min(batch_size, 10000)  # Cap at reasonable limit
+        _LOGGER.info(f"496421i HubActor batch size set to {self.batch_size}")
+    
+    #---------------------------------------------------------------------------
+    def get_progress_summary(self):
+        """
+        Get a summary of processing progress for logging and monitoring.
+        
+        Returns:
+            dict: Progress summary with batch info and processing statistics
+        """
+        return {
+            "currentBatch": self.current_batch,
+            "processedCount": self.processed_count,
+            "lastBatchSize": self.count,
+            "hasMoreData": self.has_more_data,
+            "batchSize": self.batch_size,
+            "nextTokenPresent": bool(self.next_token)
+        }
 ################################################################################
 # 
 ################################################################################
