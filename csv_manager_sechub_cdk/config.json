@@ -1,7 +1,7 @@
 {
   "principalsJson": {
       "principals": [
-        "arn:aws:iam::178113193057:role/sechub_member1"
+        "arn:aws:iam::1234:role/change_me"
       ]
   }
 }
