@@ -12,11 +12,11 @@ Parameters:
     Description: The partition in which CSV Manager for Security Hub will operate.
   Regions:
     Type: String
-    Default: us-east-1
+    Default: us-west-2
     Description: The comma-delimeted list of regions in which CSV Manager for Security Hub will operate.
   PrimaryRegion:
     Type: String
-    Default: us-east-1
+    Default: us-west-2
     Description: The region in which the S3 bucket and SSM parameters are stored.
   FindingsFolder:
     Type: String
