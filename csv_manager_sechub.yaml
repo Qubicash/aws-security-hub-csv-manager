@@ -4,7 +4,7 @@ Parameters:
     Description: IAM Role to access the CSV objects in S3.
   Frequency:
     Type: String
-    Default: cron(0 8 ? * SUN *)
+    Default: cron(0 16 ? * FRI *)
     Description: A cron or rate expression for how often the export occurs.
   Partition:
     Type: String
